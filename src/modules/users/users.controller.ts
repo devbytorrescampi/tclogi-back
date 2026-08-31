@@ -30,6 +30,15 @@ export class UsersController {
     return this.usersService.findAllLite(user.tenantId);
   }
 
+  // "Who am I" — used by the frontend's AuthGuard to confirm the Core
+  // session cookie is valid and to populate the current user in the UI,
+  // now that there's no local login response carrying that data anymore.
+  @Get('me')
+  @Roles()
+  findMe(@CurrentUser() user: { tenantId: string; id: string }) {
+    return this.usersService.findMe(user.tenantId, user.id);
+  }
+
   @Patch(':id')
   update(
     @CurrentUser() user: { tenantId: string },

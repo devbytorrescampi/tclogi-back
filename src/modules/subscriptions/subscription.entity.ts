@@ -56,6 +56,14 @@ export class Subscription {
   @Column({ nullable: true })
   mpPreapprovalId: string;
 
+  // Última vez que CoreJwtStrategy trajo esta fila desde Core
+  // (GET /subscriptions/me) — Core es la fuente de verdad de plan/estado
+  // desde la migración a Core-only auth; esto es un mirror de solo-lectura
+  // con TTL corto (ver core-jwt.strategy.ts), no algo que TCLogi escriba
+  // por su cuenta.
+  @Column({ type: 'timestamptz', nullable: true })
+  lastSyncedAt: Date | null;
+
   @CreateDateColumn()
   createdAt: Date;
 

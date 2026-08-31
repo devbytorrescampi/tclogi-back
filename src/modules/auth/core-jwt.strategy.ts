@@ -9,7 +9,31 @@ import { passportJwtSecret } from 'jwks-rsa';
 import * as crypto from 'crypto';
 import { User } from '../users/user.entity';
 import { Tenant } from '../tenants/tenant.entity';
+import { Plan, PlanFeatures } from '../plans/plan.entity';
+import { Subscription } from '../subscriptions/subscription.entity';
 import { UserRole } from '../../common/enums/user-role.enum';
+import { SubscriptionStatus } from '../../common/enums/subscription-status.enum';
+
+// Cuánto se confía en el mirror local antes de volver a pedirle a Core el
+// plan/estado actual — evita un round-trip a Core en cada request
+// autenticado, mismo espíritu que ya aplica Core con su propio JWKS
+// cacheado y el chequeo de suscripción solo en login/refresh.
+const SUBSCRIPTION_SYNC_TTL_MS = 5 * 60 * 1000;
+
+// Shape de GET /subscriptions/me en Core — ver
+// tcsoft-gateway-back/src/modules/subscriptions/subscriptions.controller.ts.
+interface CoreSubscription {
+  status: string;
+  trialEndsAt: string | null;
+  currentPeriodEnd: string | null;
+  pauseReason: string | null;
+  plan: {
+    id: string;
+    name: string;
+    trialDays: number;
+    features: { maxUsers?: number; extra?: Record<string, boolean | number> };
+  };
+}
 
 function extractFromAccessTokenCookie(req: Request): string | null {
   return req?.cookies?.['accessToken'] || null;
@@ -45,12 +69,17 @@ export interface CoreJwtPayload {
  */
 @Injectable()
 export class CoreJwtStrategy extends PassportStrategy(Strategy, 'core-jwt') {
+  private readonly coreAuthUrl: string;
+
   constructor(
     @InjectRepository(User) private readonly userRepo: Repository<User>,
     @InjectRepository(Tenant) private readonly tenantRepo: Repository<Tenant>,
-    configService: ConfigService,
+    @InjectRepository(Plan) private readonly planRepo: Repository<Plan>,
+    @InjectRepository(Subscription) private readonly subscriptionRepo: Repository<Subscription>,
+    private readonly configService: ConfigService,
   ) {
     super({
+      passReqToCallback: true,
       jwtFromRequest: ExtractJwt.fromExtractors([
         ExtractJwt.fromAuthHeaderAsBearerToken(),
         extractFromAccessTokenCookie,
@@ -68,6 +97,7 @@ export class CoreJwtStrategy extends PassportStrategy(Strategy, 'core-jwt') {
         jwksUri: configService.get<string>('CORE_JWKS_URL', 'http://core-jwks-not-configured.invalid'),
       }),
     });
+    this.coreAuthUrl = configService.get<string>('CORE_AUTH_URL', '');
   }
 
   private async findOrMirrorTenant(tenantId: string): Promise<void> {
@@ -85,7 +115,77 @@ export class CoreJwtStrategy extends PassportStrategy(Strategy, 'core-jwt') {
     await this.tenantRepo.save(tenant);
   }
 
-  async validate(payload: CoreJwtPayload) {
+  /**
+   * Trae plan/estado de Core (GET /subscriptions/me — acepta cualquier
+   * token RS256 válido de Core, no hace falta ServiceAuthGuard) y lo
+   * mirrorea en la Subscription/Plan locales, para que FeatureGuard
+   * (que sigue leyendo el mirror local, no Core directo) tenga
+   * planFeatures actualizado. Se salta el fetch si el mirror local
+   * todavía está fresco (ver SUBSCRIPTION_SYNC_TTL_MS) — no falla la
+   * request si Core no responde, solo sigue con lo que haya en el
+   * mirror (puede estar desactualizado, pero no bloquea el login).
+   */
+  private async syncSubscriptionFromCore(tenantId: string, bearerToken: string): Promise<void> {
+    const existing = await this.subscriptionRepo.findOne({ where: { tenantId } });
+    const isFresh =
+      existing?.lastSyncedAt &&
+      Date.now() - existing.lastSyncedAt.getTime() < SUBSCRIPTION_SYNC_TTL_MS;
+    if (isFresh || !this.coreAuthUrl) return;
+
+    try {
+      const res = await fetch(`${this.coreAuthUrl}/subscriptions/me`, {
+        headers: { Authorization: `Bearer ${bearerToken}` },
+      });
+      if (!res.ok) return;
+      const coreSub = (await res.json()) as CoreSubscription;
+
+      let plan = await this.planRepo.findOne({ where: { id: coreSub.plan.id } });
+      const features: PlanFeatures = {
+        maxUsers: coreSub.plan.features.maxUsers ?? 0,
+        maxWarehouses: 0,
+        maxVehicles: 0,
+        maxShipmentsPerMonth: 0,
+        hasCustomsModule: false,
+        hasMultiWarehouseTransfers: false,
+        hasRealtimeTracking: false,
+        hasReports: false,
+        // Las 7 features específicas de logística viajan en
+        // features.extra del lado de Core (ver Plan.features de Core) —
+        // se sobrescriben los defaults de arriba con lo que venga ahí.
+        ...(coreSub.plan.features.extra ?? {}),
+      };
+
+      if (!plan) {
+        plan = this.planRepo.create({
+          id: coreSub.plan.id,
+          name: coreSub.plan.name,
+          trialDays: coreSub.plan.trialDays,
+          features,
+        });
+      } else {
+        plan.name = coreSub.plan.name;
+        plan.trialDays = coreSub.plan.trialDays;
+        plan.features = features;
+      }
+      await this.planRepo.save(plan);
+
+      const subscription =
+        existing ??
+        this.subscriptionRepo.create({ tenantId, planId: plan.id });
+      subscription.planId = plan.id;
+      subscription.status = coreSub.status as SubscriptionStatus;
+      subscription.trialEndsAt = coreSub.trialEndsAt ? new Date(coreSub.trialEndsAt) : null;
+      subscription.currentPeriodEnd = coreSub.currentPeriodEnd ? new Date(coreSub.currentPeriodEnd) : null;
+      subscription.pauseReason = coreSub.pauseReason ?? null as unknown as string;
+      subscription.lastSyncedAt = new Date();
+      await this.subscriptionRepo.save(subscription);
+    } catch {
+      // Core inalcanzable — se sigue con el mirror local tal como está,
+      // en vez de tumbar el login por un problema transitorio de red.
+    }
+  }
+
+  async validate(req: Request, payload: CoreJwtPayload) {
     if (!payload?.sub || !payload?.tenantId) {
       throw new UnauthorizedException();
     }
@@ -115,9 +215,21 @@ export class CoreJwtStrategy extends PassportStrategy(Strategy, 'core-jwt') {
       user = await this.userRepo.save(user);
     }
 
+    const bearerToken =
+      ExtractJwt.fromAuthHeaderAsBearerToken()(req) ?? extractFromAccessTokenCookie(req);
+    if (bearerToken) {
+      await this.syncSubscriptionFromCore(payload.tenantId, bearerToken);
+    }
+    const subscription = await this.subscriptionRepo.findOne({
+      where: { tenantId: payload.tenantId },
+      relations: { plan: true },
+    });
+
     return {
       id: user.id,
       tenantId: user.tenantId,
+      subscriptionStatus: subscription?.status,
+      planFeatures: subscription?.plan?.features,
       email: user.email,
       role: user.role,
     };

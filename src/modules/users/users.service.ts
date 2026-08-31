@@ -49,6 +49,10 @@ export class UsersService {
     return user;
   }
 
+  async findMe(tenantId: string, id: string) {
+    return this.sanitize(await this.findOne(tenantId, id));
+  }
+
   private async assertNotLastActiveAdmin(tenantId: string, userId: string) {
     const otherActiveAdmins = await this.userRepo.count({
       where: { tenantId, role: UserRole.ADMIN, isActive: true, id: Not(userId) },
